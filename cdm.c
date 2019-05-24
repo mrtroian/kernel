@@ -10,26 +10,29 @@
 #define DEVICE_NAME "cdm_device"
 #define MINOR_DEVICES 3
 #define BUFFSIZE	1024
-#define TIMEOUT		10000
-#define IOCTL_BFCL	_IO(1,0)
-#define IOCTL_UNDO	_IO(2,0)
-#define IOCTL_FRSP	_IOR(3,0,int*)
-#define IOCTL_ECHO	_IO(0x54, 0x01)
 #define BUFFER(n)	(buffers[n])
 #define READ_P(n)	(read_a[n])
 #define CURR_P(n)	(curr[n])
 #define ITER(m, n)	(buffers[m][n])
 #define DEVICES(n)	(cdm_devices[n])
+#define SET_READ(n)	(device_meta[n] |= 0x00001000)
+#define READING(n)	(device_meta[n] & 0x00001000)
+#define END_READ(n)	(device_meta[n] &= ~0x00001000)
 #define MSG_LEN(n)	(device_meta[n] & 0x00000fff)
 #define MSG_DEL(n)	(device_meta[n] &= 0xfffff000)
 #define REG_DEV(n)	(files[n])
 #define DEV_NUM(n)	(get_device_number(n))
 #define IDENTIFY(d)	(d->f_inode->i_rdev)
 #define MSG_SET(m, n)	(device_meta[m] |= (n & 0xfff))
-#define BUFF_EMPTY(n) (FREE_SPACE(n) == BUFFSIZE)
 #define FREE_SPACE(n) (BUFFSIZE - (int)(CURR_P(n) - BUFFER(n)))
 #define WAIT_FOR_READ(cond)	(wait_event_interruptible_timeout(rqueue, cond, TIMEOUT));
 #define WAIT_FOR_WRITE(cond)	(wait_event_interruptible_timeout(wqueue, cond, TIMEOUT));
+#define BUFF_EMPTY(n) (FREE_SPACE(n) == BUFFSIZE)
+#define TIMEOUT		10000
+#define IOCTL_BFCL	_IO(1,0)
+#define IOCTL_UNDO	_IO(2,0)
+#define IOCTL_FRSP	_IOR(3,0,int*)
+#define IOCTL_ECHO	_IO(0x54, 0x01)
 
 
 MODULE_AUTHOR("Kyrylo Troian");
@@ -77,7 +80,9 @@ static int dev_open(node_t *inodep, file_t *filep)
 	int devnum;
 
 	devnum = DEV_NUM(filep);
-	READ_P(devnum) = BUFFER(devnum);
+
+	if (!READING(devnum))
+		READ_P(devnum) = BUFFER(devnum);
 	pr_info("cdm.%d: Device has been opened.\n", devnum);
 
 	return 0;
@@ -114,7 +119,6 @@ static ssize_t dev_write(file_t *filep, const char *buff, size_t length, loff_t 
 	MSG_DEL(devnum);
 	MSG_SET(devnum, i);
 	pr_info("cdm.%d: %d bytes written.\n", devnum, i);
-	READ_P(devnum) = BUFFER(devnum);
 
 	spin_unlock(&lock);
 	if (i > 0) {
@@ -133,13 +137,14 @@ static ssize_t dev_read(file_t *filep, char *buff, size_t length, loff_t *offset
 	msglen = 0;
 	devnum = DEV_NUM(filep);
 	spin_lock(&lock);
+	SET_READ(devnum);
 
-	if (BUFF_EMPTY(devnum)) {
+	if (CURR_P(devnum) == READ_P(devnum)) {
 		spin_unlock(&lock);
-		WAIT_FOR_READ(!BUFF_EMPTY(devnum));
+		WAIT_FOR_READ(CURR_P(devnum) != READ_P(devnum));
 		spin_lock(&lock);
 	}
-	msglen = CURR_P(devnum) - BUFFER(devnum);
+	msglen = CURR_P(devnum) - READ_P(devnum);
 	error = copy_to_user(buff, READ_P(devnum), msglen);
 
 	if (error != 0) {
@@ -150,6 +155,8 @@ static ssize_t dev_read(file_t *filep, char *buff, size_t length, loff_t *offset
 	READ_P(devnum) += msglen;
 	buff += msglen;
 	pr_info("cdm.%d: %d bytes read.\n", devnum, msglen);
+
+	END_READ(devnum);
 	spin_unlock(&lock);
 	wake_up_interruptible(&wqueue);
 
